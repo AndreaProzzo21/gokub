@@ -63,6 +63,8 @@ spec:
           value: "5"    # Aggiorna se la latenza cambia di +/- 5ms
         - name: POLL_INTERVAL_SEC
           value: "15"
+        - name: PING_TARGETS
+          value: "cloud=8.8.8.8:53,externaldb=1.1.1.1:53"
         - name: DEBUG
           value: "true" # Lasciamolo acceso un attimo per vedere i log
         volumeMounts:

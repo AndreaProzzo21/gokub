@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -16,6 +17,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
+
+// --- Funzioni Helper per le Variabili d'Ambiente ---
 
 func getEnvAsInt(key string, defaultVal int) int {
 	if valStr := os.Getenv(key); valStr != "" {
@@ -44,25 +47,54 @@ func getEnvAsBool(key string, defaultVal bool) bool {
 	return defaultVal
 }
 
+// parseTargets trasforma la stringa "cloud=8.8.8.8:53,db=1.1.1.1:53" in una mappa Go
+func parseTargets(raw string) map[string]string {
+	targets := make(map[string]string)
+	if raw == "" {
+		return targets
+	}
+	pairs := strings.Split(raw, ",")
+	for _, pair := range pairs {
+		kv := strings.Split(pair, "=")
+		if len(kv) == 2 {
+			targets[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+		}
+	}
+	return targets
+}
+
+// --- Logica Principale ---
+
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime)
 
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
-		log.Fatal("ERRORE: NODE_NAME non impostata.")
+		log.Fatal("ERRORE: Variabile NODE_NAME non impostata.")
 	}
 
+	// Lettura Configurazioni
 	tempThreshold := getEnvAsInt("TEMP_THRESHOLD", 2)
 	diskThreshold := getEnvAsInt("DISK_THRESHOLD", 1)
-	netThreshold := getEnvAsInt("NET_THRESHOLD", 10) // 10ms di tolleranza
+	netThreshold := getEnvAsInt("NET_THRESHOLD", 10) // 10ms di tolleranza per i ping
 	pollingInterval := getEnvAsDuration("POLL_INTERVAL_SEC", 15)
 	debugMode := getEnvAsBool("DEBUG", false)
+	
+	// Lettura dei Target di Rete Dinamici
+	pingTargetsRaw := os.Getenv("PING_TARGETS")
+	targets := parseTargets(pingTargetsRaw)
 
+	// Inizializzazione Client Kubernetes
 	config, err := rest.InClusterConfig()
-	if err != nil { log.Fatalf("ERRORE config: %v", err) }
+	if err != nil {
+		log.Fatalf("ERRORE configurazione in-cluster: %v", err)
+	}
 	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil { log.Fatalf("ERRORE clientset: %v", err) }
+	if err != nil {
+		log.Fatalf("ERRORE creazione clientset: %v", err)
+	}
 
+	// Gestione Graceful Shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sigCh := make(chan os.Signal, 1)
@@ -70,14 +102,22 @@ func main() {
 
 	go func() {
 		<-sigCh
-		log.Println("Spegnimento in corso...")
+		log.Println("Ricevuto segnale di terminazione. Spegnimento in corso...")
 		cancel()
 	}()
 
 	log.Printf("Gokub avviato su: %s (Poll: %v, Debug: %t)", nodeName, pollingInterval, debugMode)
+	if len(targets) > 0 {
+		log.Printf("Monitoraggio latenza verso i seguenti target: %v", targets)
+	} else {
+		log.Println("Nessun target di rete configurato (variabile PING_TARGETS vuota).")
+	}
 
-	var lastTemp, lastDisk, lastNet int
+	// Variabili di stato per calcolare le soglie (Delta-Patching)
+	var lastTemp, lastDisk int
+	lastNet := make(map[string]int) // Mappa per tracciare la latenza precedente di ogni target
 	var lastWasError bool
+	firstRun := true // Forza l'aggiornamento al primo ciclo
 
 	ticker := time.NewTicker(pollingInterval)
 	defer ticker.Stop()
@@ -89,73 +129,110 @@ func main() {
 		case <-ticker.C:
 			currentTemp := getCPUTemp()
 			currentDisk := getFreeDiskSpace()
-			currentNet := getNetworkLatencyMs()
+			currentNet := make(map[string]int)
+			shouldUpdate := false
 
-			if abs(currentTemp-lastTemp) >= tempThreshold || 
-			   abs(currentDisk-lastDisk) >= diskThreshold || 
-			   abs(currentNet-lastNet) >= netThreshold {
+			// 1. Controllo Soglie Hard-Ware
+			if firstRun || abs(currentTemp-lastTemp) >= tempThreshold {
+				shouldUpdate = true
+			}
+			if firstRun || abs(currentDisk-lastDisk) >= diskThreshold {
+				shouldUpdate = true
+			}
+
+			// 2. Costruzione JSON Base (Temp e Disco)
+			annotations := []string{
+				fmt.Sprintf(`"gokub.io/cpu-temp":"%d"`, currentTemp),
+				fmt.Sprintf(`"gokub.io/disk-free-gb":"%d"`, currentDisk),
+			}
+
+			// 3. Controllo Soglie di Rete Multi-Target e Costruzione JSON Rete
+			for name, address := range targets {
+				lat := getNetworkLatencyMs(address)
+				currentNet[name] = lat
 				
-				// Creazione corretta del JSON Patch con prefisso gokub.io
-				patchData := `{"metadata":{"annotations":{` +
-					`"gokub.io/cpu-temp":"` + strconv.Itoa(currentTemp) + `",` +
-					`"gokub.io/disk-free-gb":"` + strconv.Itoa(currentDisk) + `",` +
-					`"gokub.io/net-latency-ms":"` + strconv.Itoa(currentNet) + `"` +
-					`}}}`
+				if firstRun || abs(lat-lastNet[name]) >= netThreshold {
+					shouldUpdate = true
+				}
 				
+				annotations = append(annotations, fmt.Sprintf(`"gokub.io/net-latency-%s":"%d"`, name, lat))
+			}
+
+			// 4. Esecuzione Patch solo se i parametri hanno superato la soglia
+			if shouldUpdate {
+				// Assembla tutte le annotazioni in modo sicuro
+				patchData := `{"metadata":{"annotations":{` + strings.Join(annotations, ",") + `}}}`
+
 				_, err := clientset.CoreV1().Nodes().Patch(ctx, nodeName, types.StrategicMergePatchType, []byte(patchData), metav1.PatchOptions{})
-				
+
 				if err != nil {
+					// Log Spam Prevention per gli errori
 					if !lastWasError {
-						log.Printf("[ERRORE] Patch fallito su %s: %v", nodeName, err)
+						log.Printf("[ERRORE] Patch fallito sul nodo %s: %v", nodeName, err)
 						lastWasError = true
 					}
 				} else {
 					if lastWasError {
-						log.Println("[INFO] API ripristinata.")
+						log.Println("[INFO] Connessione all'API ripristinata con successo.")
 						lastWasError = false
 					}
 					if debugMode {
-						log.Printf("[DEBUG] Patch OK - Temp: %d, Disk: %d, Net: %dms", currentTemp, currentDisk, currentNet)
+						log.Printf("[DEBUG] Patch applicata con successo. Temp: %d, Disk: %d, Net: %v", currentTemp, currentDisk, currentNet)
 					}
+					
+					// Aggiorna lo stato locale per il prossimo ciclo
 					lastTemp = currentTemp
 					lastDisk = currentDisk
-					lastNet = currentNet
+					for k, v := range currentNet {
+						lastNet[k] = v
+					}
+					firstRun = false
 				}
 			}
 		}
 	}
 }
 
-// Lettura Temperatura
+// --- Funzioni di Raccolta Telemetria ---
+
+// getCPUTemp legge il sensore termico. Ritorna 35°C (valore nominale) se il sensore non esiste (es. VM).
 func getCPUTemp() int {
 	data, err := os.ReadFile("/sys/class/thermal/thermal_zone0/temp")
-	if err != nil { return 35 } // Fallback se non c'è sensore
+	if err != nil {
+		return 35
+	}
 	t, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil { return 35 }
+	if err != nil {
+		return 35
+	}
 	return t / 1000
 }
 
-// Lettura Disco Libero (Ora punta alla cartella montata dall'host!)
+// getFreeDiskSpace calcola i Gigabyte liberi sulla partizione host-root.
 func getFreeDiskSpace() int {
 	var stat syscall.Statfs_t
-	// Leggiamo /host-root che definireremo nello YAML
-	if err := syscall.Statfs("/host-root", &stat); err != nil { return 0 }
+	if err := syscall.Statfs("/host-root", &stat); err != nil {
+		return 0
+	}
 	return int((stat.Bavail * uint64(stat.Bsize)) / (1024 * 1024 * 1024))
 }
 
-// NOVITÀ: Latenza Rete in Puro Go (TCP Ping verso DNS Google)
-func getNetworkLatencyMs() int {
+// getNetworkLatencyMs esegue un dial TCP misurando il Round-Trip Time (RTT).
+func getNetworkLatencyMs(address string) int {
 	start := time.Now()
-	// Timeout di 2 secondi
-	conn, err := net.DialTimeout("tcp", "8.8.8.8:53", 2*time.Second)
+	// Timeout rigoroso di 2 secondi per evitare stalli se il target è down
+	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
 	if err != nil {
-		return 999 // Segnaliamo 999ms in caso di disconnessione
+		return 999 // Ritorna 999ms per indicare una connessione assente o pessima
 	}
 	conn.Close()
 	return int(time.Since(start).Milliseconds())
 }
 
+// abs calcola il valore assoluto per valutare i delta
 func abs(x int) int {
-	if x < 0 { return -x }
+	if x < 0 {
+		return -x
+	}
 	return x
 }

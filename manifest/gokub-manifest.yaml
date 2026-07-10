@@ -1,0 +1,91 @@
+---
+# 1. Creazione del ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gokub-sa
+  namespace: kube-system
+
+---
+# 2. Definizione dei permessi (Solo lettura e modifica dell'oggetto Node)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gokub-node-patcher
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "patch", "update"]
+
+---
+# 3. Assegnazione dei permessi al ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gokub-node-patcher-binding
+subjects:
+- kind: ServiceAccount
+  name: gokub-sa
+  namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: gokub-node-patcher
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# 4. Il DaemonSet (L'agente gokub che verrà distribuito su ogni nodo)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gokub
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: gokub
+  template:
+    metadata:
+      labels:
+        app: gokub
+    spec:
+      serviceAccountName: gokub-sa
+      hostNetwork: true # Necessario per eventuali misurazioni dirette sull'hardware di rete host
+      containers:
+      - name: gokub
+        # Sostituisci con il tuo VERO username di Docker Hub
+        image: aprozzo/gokub:v1 
+        imagePullPolicy: Always
+        
+        # --- CONFIGURAZIONI TRAMITE VARIABILI D'AMBIENTE ---
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: TEMP_THRESHOLD
+          value: "2"    # Delta di temperatura (in °C) per attivare l'aggiornamento
+        - name: DISK_THRESHOLD
+          value: "1"    # Delta di disco libero (in GB) per attivare l'aggiornamento
+        - name: POLL_INTERVAL_SEC
+          value: "30"   # Intervallo in secondi tra una misurazione e l'altra
+        - name: DEBUG
+          value: "false" # Imposta a "true" per vedere i log di successo ad ogni ciclo
+        # ---------------------------------------------------
+        
+        # Montaggio dei filesystem dell'host per la lettura dei sensori
+        volumeMounts:
+        - name: host-sys
+          mountPath: /sys
+          readOnly: true
+        - name: host-proc
+          mountPath: /proc
+          readOnly: true
+          
+      # Definizione dei volumi fisici del nodo
+      volumes:
+      - name: host-sys
+        hostPath:
+          path: /sys
+      - name: host-proc
+        hostPath:
+          path: /proc

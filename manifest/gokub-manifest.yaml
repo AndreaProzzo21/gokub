@@ -1,5 +1,4 @@
 ---
-# 1. Creazione del ServiceAccount
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -7,7 +6,6 @@ metadata:
   namespace: kube-system
 
 ---
-# 2. Definizione dei permessi (Solo lettura e modifica dell'oggetto Node)
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -18,7 +16,6 @@ rules:
   verbs: ["get", "patch", "update"]
 
 ---
-# 3. Assegnazione dei permessi al ServiceAccount
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -33,7 +30,6 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# 4. Il DaemonSet (L'agente gokub che verrà distribuito su ogni nodo)
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -49,30 +45,26 @@ spec:
         app: gokub
     spec:
       serviceAccountName: gokub-sa
-      hostNetwork: true # Necessario per eventuali misurazioni dirette sull'hardware di rete host
+      hostNetwork: true
       containers:
       - name: gokub
-        # Sostituisci con il tuo VERO username di Docker Hub
         image: aprozzo/gokub:v1 
         imagePullPolicy: Always
-        
-        # --- CONFIGURAZIONI TRAMITE VARIABILI D'AMBIENTE ---
         env:
         - name: NODE_NAME
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
         - name: TEMP_THRESHOLD
-          value: "2"    # Delta di temperatura (in °C) per attivare l'aggiornamento
+          value: "2"
         - name: DISK_THRESHOLD
-          value: "1"    # Delta di disco libero (in GB) per attivare l'aggiornamento
+          value: "1"
+        - name: NET_THRESHOLD
+          value: "5"    # Aggiorna se la latenza cambia di +/- 5ms
         - name: POLL_INTERVAL_SEC
-          value: "30"   # Intervallo in secondi tra una misurazione e l'altra
+          value: "15"
         - name: DEBUG
-          value: "false" # Imposta a "true" per vedere i log di successo ad ogni ciclo
-        # ---------------------------------------------------
-        
-        # Montaggio dei filesystem dell'host per la lettura dei sensori
+          value: "true" # Lasciamolo acceso un attimo per vedere i log
         volumeMounts:
         - name: host-sys
           mountPath: /sys
@@ -80,8 +72,11 @@ spec:
         - name: host-proc
           mountPath: /proc
           readOnly: true
+        # MONTAGGIO PER IL DISCO
+        - name: host-root
+          mountPath: /host-root
+          readOnly: true
           
-      # Definizione dei volumi fisici del nodo
       volumes:
       - name: host-sys
         hostPath:
@@ -89,3 +84,7 @@ spec:
       - name: host-proc
         hostPath:
           path: /proc
+      # VOLUME PER IL DISCO
+      - name: host-root
+        hostPath:
+          path: /
